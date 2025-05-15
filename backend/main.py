@@ -1,9 +1,11 @@
 import asyncio
-from contextvars import Context
+
+# from contextvars import Context # Unused import
 from typing import Any, Dict, List, Optional
 
 import litellm
-import pandas as pd
+
+# import pandas as pd # Unused import
 from dotenv import load_dotenv
 from litellm import BaseModel
 from llama_index.core.llms import ChatMessage
@@ -25,16 +27,6 @@ from rich.panel import Panel
 from backend.prompts.prompt_manager import generate_prompt
 
 load_dotenv()
-
-
-# set up a quick llm to test the workflow
-# llm = OpenAI(model="gpt-4o-mini") # Removed this line
-
-# Events are user-defined pydantic objects. You control the attributes and any other auxiliary methods.
-# In this case, our workflow relies on a single user-defined event.
-
-
-# marking keys are optional because some wont have values right away and I don't want pydantic errors.
 
 # Settings and Context Models
 
@@ -60,7 +52,7 @@ class WorkflowStartEvent(StartEvent):
     user_message: str
     settings: ModelSettings
     initial_models_to_use: Optional[List[str]] = None
-    # chat_history: Optional[List[Dict[str, str]]] = None
+    chat_history: Optional[List[ChatMessage]] = None
 
 
 class GlobalContext(Context):
@@ -124,6 +116,16 @@ class AppWorkFlow(Workflow):
         await ctx.set("user_message", ev.user_message)
         await ctx.set("model_settings", ev.settings)
         await ctx.set("models_to_use", ev.initial_models_to_use or ["gpt-4o-mini"])
+
+        # Initialize chat history in context from event, or as empty list
+        initial_history = ev.chat_history or []
+        # Append current user message to the history for this turn
+        # Ensure role is 'user' for user messages.
+        updated_history_for_turn = initial_history + [
+            ChatMessage(role="user", content=ev.user_message)
+        ]
+        await ctx.set("chat_history", updated_history_for_turn)
+
         return ProcessInput(
             first_output=f"First step: Received user message: {ev.user_message}"
         )
@@ -155,34 +157,73 @@ class AppWorkFlow(Workflow):
     async def llm_manager(
         self, ctx: Context, ev: DynamicPromptBuilt
     ) -> LlmResponsesCollected:
-        user_message = await ctx.get("user_message", "")
-        chat_history = await ctx.get("chat_history", [])
+        user_message = await ctx.get(
+            "user_message", ""
+        )  # For logging or if needed elsewhere
+        chat_history_from_ctx = await ctx.get(
+            "chat_history", []
+        )  # This now includes the latest user message
         system_prompt = await ctx.get("current_system_prompt", "")
         models_to_use = await ctx.get("models_to_use", [])
         global_model_settings = await ctx.get("model_settings") or ModelSettings()
 
-        # not sure how to work with chat history here.
-
-        messages = [
-            ChatMessage(role="system", content=system_prompt),
-            ChatMessage(role="user", content=user_message),
-        ]
+        # Construct messages for LLM
+        # The chat_history_from_ctx already contains the most recent user message thanks to process_input
+        messages_for_llm = [
+            ChatMessage(role="system", content=system_prompt)
+        ] + chat_history_from_ctx
 
         if not models_to_use:
             print("Warning: No models specified in models_to_use. Skipping LLM calls.")
             await ctx.set("response_candidates", [])
             return LlmResponsesCollected(responses_collected_count=0)
 
-        candidate_responses = []
-
-        llm = LiteLLM()
+        collected_responses_content: List[str] = []
 
         for model_name in models_to_use:
-            call_llm = await llm.achat(messages=messages)
-            candidate_responses.append(call_llm)
+            try:
+                print(
+                    f"Attempting to call model: {model_name} with system prompt: '{system_prompt[:50]}...'"
+                )
+                # For debugging history, print the messages being sent
+                # print(f"Full messages to {model_name}: {messages_for_llm}")
 
-        await ctx.set("response_candidates", candidate_responses)
-        return LlmResponsesCollected(responses_collected_count=len(candidate_responses))
+                llm_instance = LiteLLM(
+                    model=model_name,
+                    temperature=global_model_settings.temperature,
+                    max_tokens=global_model_settings.max_tokens,
+                )
+
+                response_obj = await llm_instance.achat(messages=messages_for_llm)
+
+                if (
+                    response_obj
+                    and response_obj.message
+                    and response_obj.message.content
+                ):
+                    collected_responses_content.append(response_obj.message.content)
+                    print(
+                        f"Response from {model_name}: {response_obj.message.content[:100]}..."
+                    )
+                else:
+                    error_msg = f"Error: No content received from {model_name}."
+                    if (
+                        response_obj
+                        and hasattr(response_obj, "raw")
+                        and response_obj.raw
+                    ):
+                        error_msg += f" Raw: {str(response_obj.raw)[:100]}"
+                    print(error_msg)
+                    collected_responses_content.append(error_msg)
+            except Exception as e:
+                error_msg = f"Error calling {model_name}: {type(e).__name__} - {e}"
+                print(error_msg)
+                collected_responses_content.append(error_msg)
+
+        await ctx.set("response_candidates", collected_responses_content)
+        return LlmResponsesCollected(
+            responses_collected_count=len(collected_responses_content)
+        )
 
     @step
     async def curation_manager(
@@ -210,13 +251,33 @@ class AppWorkFlow(Workflow):
 
     @step
     async def stop_event(self, ctx: Context, ev: CurationManager) -> StopEvent:
-        current_chat_history = await ctx.get("chat_history", [])
-        curated_response_from_event = ev.curated_response
+        # Get chat history (which includes the user's message for this turn from process_input)
+        chat_history_for_this_run = await ctx.get("chat_history", [])
+        curated_response_content = ev.curated_response
 
+        final_chat_history = (
+            chat_history_for_this_run  # Start with history up to user's message
+        )
+
+        if (
+            curated_response_content
+            and curated_response_content != "No response was curated."
+        ):
+            # Append the assistant's curated response to the history. Ensure role is 'assistant'.
+            final_chat_history = final_chat_history + [
+                ChatMessage(role="assistant", content=curated_response_content)
+            ]
+            print(
+                f"Appended assistant response to history: {curated_response_content[:50]}..."
+            )
+        else:
+            print("No valid curated response to add to chat history for this run.")
+
+        # The StopEvent will carry the fully updated chat history for this turn
         return StopEvent(
             result=WorkflowRunOutput(
-                final_response=curated_response_from_event,
-                chat_history=current_chat_history,
+                final_response=curated_response_content,
+                chat_history=final_chat_history,
             )
         )
 
@@ -236,11 +297,11 @@ async def main():
 
     # Instantiate the workflow
     # Increased timeout for potentially multiple LLM calls and human input
-    workflow = AppWorkFlow(timeout=120, verbose=True)
+    workflow = AppWorkFlow(timeout=120, verbose=False)
 
-    # Model settings can be loaded once or made configurable if needed
+    # Initialize main's local state variable for chat history
+    current_chat_history: List[ChatMessage] = []
     default_model_settings = ModelSettings()
-    # Models to use can be hardcoded or loaded from a config
     default_models_to_use = [
         "openai/gpt-4o-mini",
         "gemini/gemini-2.0-flash-lite",
@@ -262,19 +323,13 @@ async def main():
             if not user_input.strip():
                 continue
 
-            # Get the current model settings from our persistent context - This needs to change
-            # current_model_settings = await chat_session_context.get("model_settings", None)
-            # We will use default_model_settings or allow modification if GUI was present
-
             start_event = WorkflowStartEvent(
                 user_message=user_input,
-                settings=default_model_settings,  # Pass the settings
-                initial_models_to_use=default_models_to_use,  # Pass models to use
-                # chat_history=current_chat_history,  # Pass current chat history
+                settings=default_model_settings,
+                initial_models_to_use=default_models_to_use,
+                chat_history=current_chat_history,  # Pass current chat history
             )
 
-            # Run the workflow with the user's message
-            # The context argument is removed as per the warning
             workflow_result = await workflow.run(start_event=start_event)
 
             if isinstance(workflow_result, WorkflowRunOutput):
@@ -282,6 +337,7 @@ async def main():
                 current_chat_history = (
                     workflow_result.chat_history
                 )  # Update main's chat_history
+
                 console.print(
                     Panel(
                         (
