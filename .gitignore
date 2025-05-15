@@ -6,7 +6,7 @@
 /.vscode
 /backend/.venv
 /backend/__pycache__
-/docs
+/app_docs
 /data/
 /backend/data/*
 /backend/prompts/*
