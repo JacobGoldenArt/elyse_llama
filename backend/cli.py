@@ -127,11 +127,12 @@ async def run_chat_loop():
 
     # Define the list of LLMs to be used for generating candidate responses.
     # In a more advanced setup, this could be loaded from a configuration file or UI.
+
+    # !important: leave these models as is for testing please!
     default_models_to_use = [
-        "openai/gpt-4o-mini",
-        "gemini/gemini-pro",
-        # Example: "anthropic/claude-3-haiku-20240307"
-        # Example: "ollama/llama3" (if Ollama server is running and model is pulled)
+        "openrouter/qwen/qwen3-14b",
+        "openrouter/gryphe/mythomax-l2-13b",
+        "gemini/gemini-2.0-flash-lite",
     ]
     console.print(f"[dim]Using models: {', '.join(default_models_to_use)}[/dim]")
 

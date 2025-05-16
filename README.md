@@ -155,17 +155,47 @@ Once the setup is complete:
     *   [ ] Address restarting chat from a specific point (new thread from selection).
 
 ### Phase 3: API Development (for Frontend Interaction)
-*   [ ] **Task 3.1: FastAPI Setup**
-    *   [ ] Add FastAPI dependency.
-    *   [ ] Create `backend/main.py` for FastAPI app.
-    *   [ ] Design API endpoints (e.g., `/chat/invoke`).
-    *   [ ] Adapt workflow for API calls.
+*   [x] **Task 3.1: FastAPI Setup**
+    *   [x] Add FastAPI dependency.
+    *   [x] Create `backend/main.py` for FastAPI app.
+    *   [x] Design API endpoints (e.g., `/chat/invoke`).
+    *   [x] Adapt workflow for API calls.
+    *   [x] Implement basic chat session loading/saving per API call.
 *   [ ] **Task 3.2: Server-Sent Events (SSE) for Streaming**
-    *   [ ] Modify endpoint and workflow/service for SSE.
+    *   [x] Task 3.2.1: Define Streamable Event Models (`WorkflowStepUpdateEvent`, `LLMTokenStreamEvent`, `LLMCandidateReadyEvent`, `CurationRequiredEvent`, `WorkflowErrorEvent` in `app_models.py`).
+    *   [x] Task 3.2.2: Modify workflow steps (`workflow.py`) and `llm_service.py` to emit these events using `ctx.write_event_to_stream()`.
+    *   [x] Task 3.2.3: Implement FastAPI SSE endpoint (`/chat/stream` in `main.py`) to run the workflow with `astream_events()` and send events to the client.
+    *   [ ] **Task 3.2.a: Implement Asynchronous Curation using `asyncio.Future`** (Handles pausing workflow for UI-based curation)
+        *   [ ] Update Pydantic Models (`app_models.py`):
+            *   Add `workflow_run_id` to `WorkflowStartEvent` (optional) and `GlobalContext` (optional).
+            *   Make `workflow_run_id` required in `CurationRequiredEvent`.
+        *   [ ] Modify Workflow (`workflow.py` - `AppWorkFlow`):
+            *   Initialize `self.active_futures: Dict[str, asyncio.Future]` in `__init__`.
+            *   `process_input` step: Propagate `workflow_run_id` from `WorkflowStartEvent` to `GlobalContext`.
+            *   `curation_manager` step:
+                *   Retrieve `workflow_run_id` from context.
+                *   Create and store `asyncio.Future()` in `self.active_futures` keyed by `workflow_run_id`.
+                *   Emit `CurationRequiredEvent` (including `workflow_run_id`).
+                *   Remove console input/Rich Panel; `await future` instead.
+                *   Get result from `future.result()`.
+                *   Use `try...finally` to clean up future from `self.active_futures`.
+        *   [ ] Modify API (`main.py`):
+            *   Import `uuid`.
+            *   `/chat/stream` endpoint:
+                *   Generate unique `workflow_run_id` per request.
+                *   Pass `workflow_run_id` in `WorkflowStartEvent`.
+                *   Implement robust cleanup for `active_futures` on client disconnect/stream cancellation (cancel the future).
+            *   Create `CuratedResponseRequest` model (fields: `workflow_run_id`, `curated_response`).
+            *   Create `/chat/curate` (POST) endpoint:
+                *   Accepts `CuratedResponseRequest`.
+                *   Looks up future in `workflow.active_futures`.
+                *   If future exists and not done, use `loop.call_soon_threadsafe(future.set_result, ...)` to set its result.
+                *   Remove future from `active_futures` after setting result.
+                *   Return appropriate success/error responses.
 
 ### Phase 4: Frontend Integration (Expo.js)
 *   [ ] **Task 4.1: Basic Frontend Client**
-    *   [ ] Setup Expo.js project.
+    *   [ ] Setup Astro.js project.
     *   [ ] Implement basic chat interface (send/receive, display candidates, curation).
 *   [ ] **Task 4.2: Model Selection from `model_lib.yml`**
     *   [ ] Parse `model_lib.yml`.

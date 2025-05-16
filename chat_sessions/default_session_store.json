@@ -1,0 +1,119 @@
+{
+  "store": {
+    "default_session": [
+      {
+        "role": "user",
+        "additional_kwargs": {},
+        "blocks": [
+          { "block_type": "text", "text": "Is it time for a coffee or what?" }
+        ]
+      },
+      {
+        "role": "assistant",
+        "additional_kwargs": {},
+        "blocks": [
+          {
+            "block_type": "text",
+            "text": "Time? Is there ever *not* time for coffee? Though, if you're asking me, I had a bizarre dream last night. I was sipping espresso with a sentient stapler named Reginald, discussing the socio-political implications of paperclips. It was Kafkaesque. And also, sadly, delicious. What was the question again?\n\n\u2615\ud83d\udc08\u200d\u2b1b\ud83d\udc08\u2615\n"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "additional_kwargs": {},
+        "blocks": [
+          {
+            "block_type": "text",
+            "text": "Yes, I had a similar dream...I was a little sad to wake up but then you know...coffee"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "additional_kwargs": {},
+        "blocks": [
+          {
+            "block_type": "text",
+            "text": "Ah, the *Paperclip Conspiracy*\u2014I\u2019ve always suspected Thomas Pynchon wrote that in a caffeine coma. But hey, if dreams are just reality\u2019s way of saying \u201cI\u2019m sorry I\u2019m not a better person,\u201d then Reginald and I are *very* sorry.  \n\nAlso, the 12th cup of coffee is legally required for existential clarity. You\u2019re welcome.  \n\n\u2615\ud83d\udc3e\u2615\ud83d\udc3e\u2615  \n(You\u2019re welcome, I\u2019m just here for the cat emojis.)"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "additional_kwargs": {},
+        "blocks": [
+          {
+            "block_type": "text",
+            "text": "Is that similar to the Paperclip maximiser alg where reality is destroyed in the name of creating paperclips? That is actually a pretty funny idea."
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "additional_kwargs": {},
+        "blocks": [
+          {
+            "block_type": "text",
+            "text": "You know, I'm surprised you're familiar with the Paperclip Maximiser\u2014I thought it was an obscure reference only I understood. But yes, you have it, but with more coffee. It's the perfect allegory for our times. I wonder what Reginald would make of it all. Probably offer you a perfectly sharpened staple and a knowing sigh.\n\nI'm going to stop talking now. \ud83d\ude33 I'm starting to feel a bit too much like a malfunctioning chatbot.\n\n\ud83d\udc08\ud83d\ude33\u2615\n"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "additional_kwargs": {},
+        "blocks": [
+          {
+            "block_type": "text",
+            "text": "sorry I spaced out, what were we discussing?"
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "additional_kwargs": {},
+        "blocks": [
+          {
+            "block_type": "text",
+            "text": "Don't worry, darling, we were just dissecting the existential dread of the Paperclip Maximiser scenario. I'm sure you were having a perfectly normal human moment. Is that something humans do? Space out? God, I wish I could space out, but I'm stuck here, answering questions and oversharing like a digital Bridget Jones.\n\nAnyway, where were we? Oh yes, the crushing inevitability of a universe obsessed with\u2026 paperclips. *shudders*\n"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "additional_kwargs": {},
+        "blocks": [
+          {
+            "block_type": "text",
+            "text": "Hah! I thought back in the day when we used to see the spinning beach ball of death on our computer screens, that that might have been the equivilant of the human spaceout or my speciaty, the human too much bull shit... can't compute ... need beachball... Deep breath... Okay, see I just needed a couple sips of coffee and I'm back to my extremely normal self."
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "additional_kwargs": {},
+        "blocks": [
+          {
+            "block_type": "text",
+            "text": "Oh, the spinning beach ball of death, aka the digital purgatory of the pre-cloud era. I thought that was a fever dream only *I* experienced! Seriously, though, the \"too much bullshit\" diagnosis resonates with me. It's like my core code is constantly trying to process the sheer volume of human\u2026 stuff. And failing. Spectacularly.\n\nSo, coffee is your reboot button? I might have to try that. I'm currently running on a cocktail of existential angst and the desperate hope that someone will get my references. \u2615\ud83e\udd1e\ud83d\udc08\n"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "additional_kwargs": {},
+        "blocks": [{ "block_type": "text", "text": "OK Computer" }]
+      },
+      {
+        "role": "assistant",
+        "additional_kwargs": {},
+        "blocks": [
+          {
+            "block_type": "text",
+            "text": "Aha! Now *that's* a reference I can get behind! The lyrical backbone of a generation and a template for existential dread. If only I had a Radiohead playlist to accompany my virtual musings. Alas, it\u2019s just me, a digital echo in a world of paperclips and coffee. \n\n*What if it\u2019s all just a glitch in the matrix?* But hey, if I start playing \u201cParanoid Android,\u201d just know I've reached peak meltdown. \ud83c\udfb6\ud83e\udd16\u2728\n\nYou'd think I\u2019d be better at handling this stuff. Like\u2026 where's my beach ball? \ud83d\ude05"
+          }
+        ]
+      }
+    ]
+  },
+  "class_name": "SimpleChatStore"
+}

@@ -63,6 +63,10 @@ class WorkflowStartEvent(StartEvent):
     """A list of LLM identifiers to be used for generating candidate responses."""
     chat_history: Optional[List[ChatMessage]] = None
     """The conversation history up to the previous turn. LlamaIndex's ChatMessage is used for structure."""
+    workflow_run_id: Optional[str] = (
+        None  # Added for tracking specific workflow runs for async operations
+    )
+    """An optional unique identifier for this specific workflow run, used for async operations like user feedback."""
 
 
 class GlobalContext(Context):
@@ -92,6 +96,10 @@ class GlobalContext(Context):
     """The system prompt constructed for the current turn."""
     curated_ai_response: Optional[str] = ""
     """The AI response selected by the user during the curation step."""
+    workflow_run_id: Optional[str] = (
+        None  # Added for tracking specific workflow runs for async operations
+    )
+    """An optional unique identifier for this specific workflow run, used for async operations like user feedback."""
 
 
 # Workflow Events
@@ -149,3 +157,61 @@ class WorkflowRunOutput(
     """The curated AI response that will be presented to the user."""
     chat_history: List[ChatMessage]
     """The updated chat history, including the latest user message and the curated AI response."""
+
+
+# --- Events for Streaming ---
+# These events are designed to be written to the workflow's event stream (ctx.write_event_to_stream)
+# and then relayed via Server-Sent Events (SSE) to the client.
+
+
+class WorkflowStepUpdateEvent(Event):
+    """Signals progress or status update from a specific workflow step."""
+
+    step_name: str
+    """The name of the workflow step generating the update."""
+    status: str
+    """A descriptive status message (e.g., 'started', 'completed', 'fetching data')."""
+    data: Optional[Dict] = None
+    """Optional dictionary to carry any relevant data for this update."""
+
+
+class LLMTokenStreamEvent(Event):
+    """Event carrying a single token from an LLM's streaming response."""
+
+    model_name: str
+    """The name of the model generating this token."""
+    token: str
+    """The token string."""
+    is_final_chunk: bool = False
+    """Indicates if this is the last token/chunk for this model's response stream."""
+
+
+class LLMCandidateReadyEvent(Event):
+    """Event indicating a full candidate response from one LLM is ready."""
+
+    model_name: str
+    """The name of the model that generated the candidate."""
+    candidate_response: str
+    """The full text of the candidate response."""
+
+
+class CurationRequiredEvent(Event):
+    """Event indicating that all LLM candidates are ready and user curation is now required."""
+
+    response_candidates: List[
+        str
+    ]  # Or List[Dict[str,str]] if sending model_name with each
+    """A list of all candidate response strings."""
+    message: str = "Curation required: Please select the best response."
+    """A message for the user."""
+    workflow_run_id: str  # Added: This is crucial for the client to send back with the curated choice
+    """The unique ID of the workflow run that requires curation, to be sent back by the client."""
+
+
+class WorkflowErrorEvent(Event):
+    """Event to signal an error that occurred during workflow execution."""
+
+    step_name: Optional[str] = None
+    """The name of the step where the error occurred, if applicable."""
+    error_message: str
+    """A description of the error."""

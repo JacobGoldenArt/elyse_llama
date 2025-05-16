@@ -1,0 +1,36 @@
+# Add directories or file patterns to ignore during indexing (e.g. foo/ or *.csv)
+# build output
+dist/
+# generated types
+.astro/
+_resources_master/*
+
+# dependencies
+node_modules/
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+
+# environment variables
+.env
+.env.production
+.venv/
+node_modules/
+.vscode/
+.gitignore
+.git/
+.gitignore
+.cursorignore
+.cursorignore
+
+
+
+# macOS-specific files
+.DS_Store
+
+# jetbrains setting folder
+.idea/
