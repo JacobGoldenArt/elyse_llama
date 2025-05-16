@@ -37,10 +37,20 @@ from backend.app_models import (
 from backend.workflow import AppWorkFlow
 
 """
-This module provides the FastAPI application server for the Elyse AI backend.
+Provides the FastAPI application server for the Elyse AI backend.
 
-It exposes API endpoints that allow clients (e.g., a frontend application) 
-to interact with the AI workflow, send messages, manage sessions, and receive responses.
+This module defines the API endpoints that client applications (e.g., a frontend UI)
+use to interact with the AI workflow. Key functionalities include:
+- Starting new chat sessions or continuing existing ones.
+- Sending user messages and receiving AI-generated responses.
+- Streaming workflow events (like LLM tokens, step updates, and curation requests)
+  over Server-Sent Events (SSE) for real-time updates.
+- Handling human-in-the-loop curation of AI responses.
+- Managing chat history persistence.
+
+The server utilizes LlamaIndex for the core workflow logic and FastAPI for the
+web framework. It's configured for CORS to allow cross-origin requests from
+frontends.
 """
 
 load_dotenv()
@@ -59,7 +69,7 @@ console = Console()  # Added for styled printing
 # --- FastAPI App Initialization ---
 app = FastAPI(
     title="Elyse AI Workflow API",
-    description="API for interacting with the Elyse AI chat workflow, powered by LlamaIndex and FastAPI.",
+    description="API for interacting with the Elyse AI chat workflow, powered by LlamaIndex and FastAPI. Provides endpoints for chat, streaming, and curation.",
     version="0.1.0",
 )
 
@@ -93,7 +103,11 @@ print(f"--- Attributes of workflow instance: {str(dir(workflow))}")
 
 
 class ChatInvokeRequest(PydanticBaseModel):
-    """Request model for the /chat/invoke endpoint."""
+    """
+    Request model for the `/chat/invoke` endpoint.
+
+    Used for non-streaming, single-response chat interactions.
+    """
 
     user_message: str
     session_id: Optional[str] = DEFAULT_SESSION_ID
@@ -103,9 +117,12 @@ class ChatInvokeRequest(PydanticBaseModel):
     )
 
 
-# Define a similar request model for the streaming endpoint
 class ChatStreamRequest(PydanticBaseModel):
-    """Request model for the /chat/stream endpoint."""
+    """
+    Request model for the `/chat/stream` endpoint.
+
+    Used for initiating a chat interaction where events are streamed back to the client.
+    """
 
     user_message: str
     session_id: Optional[str] = DEFAULT_SESSION_ID
@@ -114,14 +131,23 @@ class ChatStreamRequest(PydanticBaseModel):
 
 
 class CuratedResponseRequest(PydanticBaseModel):
-    """Request model for submitting a curated response."""
+    """
+    Request model for the `/chat/curate` endpoint.
+
+    Used to submit the human-selected or edited response for a workflow run
+    that is awaiting curation.
+    """
 
     workflow_run_id: str
     curated_response: str
 
 
 class ChatInvokeResponse(PydanticBaseModel):
-    """Response model for the /chat/invoke endpoint, mirrors WorkflowRunOutput."""
+    """
+    Response model for the `/chat/invoke` endpoint.
+
+    Mirrors `WorkflowRunOutput` for consistency.
+    """
 
     final_response: str
     chat_history: List[ChatMessage]
@@ -135,25 +161,45 @@ class ChatInvokeResponse(PydanticBaseModel):
 @app.post("/chat/invoke", response_model=ChatInvokeResponse)
 async def chat_invoke(request: ChatInvokeRequest) -> ChatInvokeResponse:
     """
-    Main endpoint to interact with the chat workflow.
+    Endpoint for a single, non-streaming chat interaction.
 
-    Receives a user message and other session parameters, runs the AI workflow,
-    persists the updated chat history, and returns the AI's response along with
-    the updated history.
+    Receives a user message, session ID (optional), and settings (optional).
+    It runs the full AI workflow, waits for its completion (including any
+    internal curation if configured differently or if it's a simplified path),
+    persists the updated chat history, and returns the final AI response.
+
+    This endpoint is suitable for clients that do not require real-time streaming
+    of events or intermediate LLM outputs.
+
+    Args:
+        request: A `ChatInvokeRequest` Pydantic model containing the user's message,
+                 session ID, and optional settings.
+
+    Returns:
+        A `ChatInvokeResponse` Pydantic model with the final AI response,
+        the complete updated chat history, and the session ID.
+
+    Raises:
+        HTTPException: If there's an internal server error during workflow execution
+                       or if the workflow returns an unexpected output type.
     """
     print(f"[CHAT INVOKE] Received request: {request.model_dump()}")
     session_id = request.session_id or DEFAULT_SESSION_ID
     chat_store_path = os.path.join(CHAT_SESSIONS_DIR, f"{session_id}_store.json")
 
     # Load chat store for the session
-    chat_store = SimpleChatStore.from_persist_path(persist_path=chat_store_path)
-    current_chat_history = chat_store.get_messages(session_id)
+    try:
+        chat_store = SimpleChatStore.from_persist_path(persist_path=chat_store_path)
+        current_chat_history = chat_store.get_messages(session_id)
+    except FileNotFoundError:
+        console.print(
+            f"[CHAT INVOKE] No chat history found for session {session_id} at {chat_store_path}, starting new."
+        )
+        chat_store = SimpleChatStore()  # Initialize a new store
+        current_chat_history = []
 
     # Prepare settings and models to use
-    # If request provides them, use those, otherwise use defaults (which workflow handles if None)
-    active_model_settings = (
-        request.settings if request.settings else ModelSettings()
-    )  # Default if not provided
+    active_model_settings = request.settings or ModelSettings()
     active_models_to_use = (
         request.initial_models_to_use
     )  # Can be None, workflow handles default
@@ -163,13 +209,32 @@ async def chat_invoke(request: ChatInvokeRequest) -> ChatInvokeResponse:
         settings=active_model_settings,
         initial_models_to_use=active_models_to_use,
         chat_history=current_chat_history,
+        # workflow_run_id is not strictly needed here unless invoke also supported async curation later
     )
 
     try:
-        workflow_run_output = await workflow.run(start_event=start_event)
+        # Note: The AppWorkFlow.run method is synchronous. If it internally awaits
+        # a future (like in curation_manager), this FastAPI path will block.
+        # For /invoke, this might be acceptable if curation is fast or if this path
+        # implies a workflow variant without long waits.
+        # If curation is always async via API, /invoke might need a different workflow path
+        # or a timeout mechanism for user input if it were to support it directly.
+        # Current AppWorkFlow expects curation_manager to potentially wait on an external signal.
+        # This means /invoke might hang if it hits curation_manager and no one calls /chat/curate.
+        # For true non-streaming invoke, the workflow might need a different "curation_mode".
+        # For now, we assume if /invoke is used, curation might be simpler or handled differently.
+        # Or, more likely, /invoke is less used if full async curation is the primary mode.
+
+        # Let's assume a synchronous run, which will indeed block if curation_manager waits on a future.
+        # To make this truly synchronous without external curation, workflow would need modification.
+        # Given current setup, this /invoke will block if it hits the future.wait in curation.
+        # This implies /invoke is for workflows that resolve curation internally or don't require it.
+
+        # Re-evaluating: workflow.run() returns a handler. We need to await the handler for the result.
+        handler = workflow.run(start_event=start_event)
+        workflow_run_output = await handler  # Await the final result from the handler
 
         if not isinstance(workflow_run_output, WorkflowRunOutput):
-            # This should ideally not happen if the workflow is correctly configured
             raise HTTPException(
                 status_code=500, detail="Workflow returned an unexpected output type."
             )
@@ -177,6 +242,9 @@ async def chat_invoke(request: ChatInvokeRequest) -> ChatInvokeResponse:
         # Update and persist chat store
         chat_store.set_messages(session_id, workflow_run_output.chat_history)
         chat_store.persist(persist_path=chat_store_path)
+        console.print(
+            f"[CHAT INVOKE] Chat history persisted for session {session_id} to {chat_store_path}"
+        )
 
         return ChatInvokeResponse(
             final_response=workflow_run_output.final_response,
@@ -184,9 +252,11 @@ async def chat_invoke(request: ChatInvokeRequest) -> ChatInvokeResponse:
             session_id=session_id,
         )
     except Exception as e:
-        # Log the exception for server-side debugging
-        print(f"Error during workflow execution for session {session_id}: {e}")
-        # Consider more specific error handling and user-friendly messages
+        console.print(
+            f"Error during /chat/invoke for session {session_id}: {e}",
+            style="bold red",
+            exc_info=True,
+        )
         raise HTTPException(
             status_code=500, detail=f"An internal error occurred: {str(e)}"
         )
@@ -198,33 +268,63 @@ async def chat_stream(
     api_request: ChatStreamRequest, httpRequest: Request
 ):  # Added httpRequest for disconnect
     """
-    Streaming endpoint for chat, using Server-Sent Events (SSE).
+    Streaming endpoint for chat interactions using Server-Sent Events (SSE).
 
-    Receives user message and session parameters, then streams workflow events
-    (step updates, LLM tokens, candidate readiness, curation requests) back to the client.
-    Handles chat history loading and persistence similarly to the invoke endpoint.
-    Curation is now handled asynchronously via a specific workflow_run_id and the /chat/curate endpoint.
+    This endpoint initiates a chat workflow run. It receives user input, loads
+    relevant chat history, and then starts the `AppWorkFlow`. As the workflow
+    progresses, it generates various events (e.g., `WorkflowStepUpdateEvent`,
+    `LLMTokenStreamEvent`, `LLMCandidateReadyEvent`, `CurationRequiredEvent`).
+    These events are streamed back to the client in real-time, formatted
+    according to the Vercel AI SDK Data Stream specification.
+
+    The `workflow_run_id` generated for this interaction is crucial for the
+    `CurationRequiredEvent`. When this event is emitted, the client (or user)
+    is expected to make a separate call to the `/chat/curate` endpoint, providing
+    this `workflow_run_id` and the chosen response, to allow the workflow to continue.
+
+    Handles client disconnects by attempting to cancel the ongoing workflow's
+    curation future.
+
+    Args:
+        api_request: A `ChatStreamRequest` Pydantic model containing the user's message,
+                     session ID, and optional settings.
+        httpRequest: The FastAPI `Request` object, used to detect client disconnects.
+
+    Returns:
+        A `StreamingResponse` that sends events to the client.
     """
     print(
         f"[/chat/stream] Received API request: {api_request.model_dump_json(indent=2)}"
     )
     session_id = api_request.session_id or DEFAULT_SESSION_ID
     chat_store_path = os.path.join(CHAT_SESSIONS_DIR, f"{session_id}_store.json")
-    workflow_run_id = str(uuid.uuid4())
+    workflow_run_id = str(
+        uuid.uuid4()
+    )  # Unique ID for this specific workflow interaction
     print(f"[/chat/stream] Generated workflow_run_id: {workflow_run_id}")
 
-    chat_store = SimpleChatStore.from_persist_path(persist_path=chat_store_path)
-    raw_chat_history = chat_store.get_messages(session_id)
+    try:
+        chat_store = SimpleChatStore.from_persist_path(persist_path=chat_store_path)
+        raw_chat_history = chat_store.get_messages(session_id)
+    except FileNotFoundError:
+        console.print(
+            f"[/chat/stream] No chat history found for session {session_id} at {chat_store_path}, starting new."
+        )
+        chat_store = SimpleChatStore()  # Initialize a new store
+        raw_chat_history = []
+
     print(
         f"[/chat/stream] Loaded {len(raw_chat_history)} raw messages from chat history for session {session_id}"
     )
 
-    # Normalize chat history
+    # Normalize chat history: Ensure all messages are simple ChatMessage objects
+    # without complex nested structures like 'blocks' that might cause issues
+    # with Pydantic validation or LlamaIndex components expecting simpler ChatMessage.
     normalized_chat_history: List[ChatMessage] = []
     for msg in raw_chat_history:
         content = ""
-        # Try to extract content from known structures
         if hasattr(msg, "blocks") and msg.blocks and isinstance(msg.blocks, list):
+            # Extract text from the first text block if present
             for block in msg.blocks:
                 if (
                     hasattr(block, "block_type")
@@ -232,62 +332,46 @@ async def chat_stream(
                     and hasattr(block, "text")
                 ):
                     content = block.text
-                    break
+                    break  # Use first text block
         elif hasattr(msg, "content") and msg.content is not None:
             content = str(msg.content)
         else:
-            # Fallback if content cannot be readily extracted (e.g. tool calls we aren't handling yet for history)
             content = "[Non-text content or unable to parse]"
 
-        # Create a new, simple ChatMessage, explicitly setting additional_kwargs to empty
         normalized_chat_history.append(
             ChatMessage(role=msg.role, content=content, additional_kwargs={})
         )
 
     print(
-        f"[/chat/stream] Normalized chat history ({len(normalized_chat_history)} messages) for event construction:"
+        f"[/chat/stream] Normalized chat history ({len(normalized_chat_history)} messages) for event construction."
     )
-    for i, msg_obj in enumerate(normalized_chat_history):
-        # For printing, let's see its dict representation to be sure
-        print(
-            f"  [{i}] Role: {msg_obj.role}, Content: '{str(msg_obj.content)[:70]}...', KWArgs: {msg_obj.additional_kwargs}"
-        )
+    # Verbose logging of normalized history can be added here if needed for debugging
 
-    active_model_settings = (
-        api_request.settings if api_request.settings else ModelSettings()
-    )
+    active_model_settings = api_request.settings or ModelSettings()
     active_models_to_use = api_request.initial_models_to_use
 
-    # Create the start event WITH the normalized history
     start_event = WorkflowStartEvent(
         user_message=api_request.user_message,
         settings=active_model_settings,
         initial_models_to_use=active_models_to_use,
-        chat_history=normalized_chat_history,  # Use the list of new, simple ChatMessage objects
-        workflow_run_id=workflow_run_id,
+        chat_history=normalized_chat_history,
+        workflow_run_id=workflow_run_id,  # Pass the unique ID to the workflow
     )
-
-    # Now, let's log the chat_history part of the actual start_event *object* before model_dump_json
-    print(
-        f"[/chat/stream] Verifying chat_history in constructed start_event object (before serialization):"
-    )
-    if start_event.chat_history:
-        for i, ch_msg in enumerate(start_event.chat_history):
-            print(
-                f"  EVENT_MSG [{i}] Role: {ch_msg.role}, Content: '{str(ch_msg.content)[:70]}...', KWArgs: {ch_msg.additional_kwargs}, Has Blocks: {hasattr(ch_msg, 'blocks') and bool(getattr(ch_msg, 'blocks', None))}"
-            )
 
     print(
         f"[/chat/stream] Logging WorkflowStartEvent (via model_dump_json) to be passed to workflow: {start_event.model_dump_json(indent=2)}"
     )
 
     async def event_generator() -> AsyncGenerator[str, None]:
+        """
+        Async generator that runs the workflow and yields SSE-formatted events.
+        """
         print(f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Event generator started.")
-        stream_active = True
-        handler = None
+        handler = None  # WorkflowHandler
         try:
             print(f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Calling workflow.run()...")
-            # Run the asynchronous workflow.run()
+            # workflow.run() is synchronous but returns a handler quickly.
+            # The actual async work happens when we iterate handler.stream_events().
             handler = workflow.run(start_event=start_event)
             print(
                 f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] workflow.run() returned handler: {type(handler)}. Iterating handler.stream_events()..."
@@ -298,18 +382,17 @@ async def chat_stream(
                     f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Received event from handler.stream_events(): {type(event).__name__}"
                 )
                 if await httpRequest.is_disconnected():
-                    stream_active = False
-                    # Attempt to retrieve the future associated with this workflow_run_id
-                    # The workflow_run_id should be available in the scope
+                    print(
+                        f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Client disconnected detected."
+                    )
                     future_to_cancel = workflow.active_futures.pop(
                         workflow_run_id, None
                     )
                     if future_to_cancel and not future_to_cancel.done():
-                        # Ensure the future is cancelled on the loop it was created on
                         loop = future_to_cancel.get_loop()
                         loop.call_soon_threadsafe(future_to_cancel.cancel)
                         print(
-                            f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Client disconnected, future cancelled."
+                            f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Curation future cancelled due to client disconnect."
                         )
                     else:
                         print(
@@ -318,27 +401,51 @@ async def chat_stream(
                     print(
                         f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Breaking stream due to client disconnect."
                     )
-                    break
+                    break  # Exit the event streaming loop
 
                 event_payload_str = None
+                # Vercel AI SDK Data Stream Format:
+                # Type 0: Text delta (e.g., LLM token stream)
+                # Type 1: Error
+                # Type 2: JSON data (custom events like step updates, candidate ready, curation required)
+                # Type 'd': Metadata (sent with finishReason when stream stops)
+
                 if isinstance(event, LLMTokenStreamEvent):
-                    event_payload_str = f"0:{json.dumps(event.token)}\n"
+                    event_payload_str = f"0:{json.dumps(event.token)}\\n"
                 elif isinstance(event, WorkflowStepUpdateEvent):
                     payload = {"type": "workflow_step_update", **event.model_dump()}
-                    event_payload_str = f"2:{json.dumps(payload)}\n"
+                    event_payload_str = f"2:{json.dumps(payload)}\\n"
                 elif isinstance(event, LLMCandidateReadyEvent):
                     payload = {"type": "llm_candidate_ready", **event.model_dump()}
-                    event_payload_str = f"2:{json.dumps(payload)}\n"
+                    event_payload_str = f"2:{json.dumps(payload)}\\n"
                 elif isinstance(event, CurationRequiredEvent):
                     payload = {"type": "curation_required", **event.model_dump()}
-                    event_payload_str = f"2:{json.dumps(payload)}\n"
+                    event_payload_str = f"2:{json.dumps(payload)}\\n"
                 elif isinstance(event, WorkflowErrorEvent):
                     payload = {"type": "workflow_error", **event.model_dump()}
-                    event_payload_str = f"1:{json.dumps(payload)}\n"
+                    event_payload_str = f"1:{json.dumps(payload)}\\n"
                 elif isinstance(event, StopEvent):
                     workflow_run_output = event.result
                     if isinstance(workflow_run_output, WorkflowRunOutput):
-                        yield f"0:{json.dumps(workflow_run_output.final_response)}\n"
+                        # Send final response text as Type 0
+                        yield f"0:{json.dumps(workflow_run_output.final_response)}\\n"
+                        # Persist chat history upon successful completion before sending metadata
+                        try:
+                            chat_store.set_messages(
+                                session_id, workflow_run_output.chat_history
+                            )
+                            chat_store.persist(persist_path=chat_store_path)
+                            console.print(
+                                f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Chat history persisted for session {session_id} to {chat_store_path} after StopEvent."
+                            )
+                        except Exception as e_persist:
+                            console.print(
+                                f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Error persisting chat history for session {session_id}: {e_persist}",
+                                style="bold red",
+                                exc_info=True,
+                            )
+                            # Decide if this should be a streamed error or just server log
+
                         chat_history_serializable = [
                             msg.model_dump() for msg in workflow_run_output.chat_history
                         ]
@@ -346,10 +453,10 @@ async def chat_stream(
                             "finishReason": "stop",
                             "chatHistory": chat_history_serializable,
                         }
-                        yield f"d:{json.dumps(metadata_payload)}\n"
+                        yield f"d:{json.dumps(metadata_payload)}\\n"
                     elif (
                         isinstance(workflow_run_output, dict)
-                        and "error" in workflow_run_output
+                        and "error" in workflow_run_output  # from on_error
                     ):
                         error_payload = {
                             "type": "workflow_error",
@@ -358,46 +465,74 @@ async def chat_stream(
                             ),
                             "error_message": str(workflow_run_output["error"]),
                         }
-                        yield f"1:{json.dumps(error_payload)}\n"
-                    else:
+                        yield f"1:{json.dumps(error_payload)}\\n"
+                    else:  # Unexpected result from StopEvent
                         error_payload = {
                             "type": "workflow_error",
                             "step_name": "stop_event",
-                            "error_message": "Workflow completed with an unexpected result type.",
+                            "error_message": "Workflow completed with an unexpected result type in StopEvent.",
                         }
-                        yield f"1:{json.dumps(error_payload)}\n"
+                        yield f"1:{json.dumps(error_payload)}\\n"
                     print(
-                        f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] StopEvent received, breaking stream."
+                        f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] StopEvent received and processed, breaking stream."
                     )
-                    break
+                    break  # Exit the event streaming loop
 
                 if event_payload_str:
                     yield event_payload_str
 
         except asyncio.CancelledError:
+            # This can happen if the workflow itself is cancelled, e.g., by timeout,
+            # or if the future in curation_manager is cancelled and the error propagates.
             print(
-                f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Stream cancelled (asyncio.CancelledError)."
+                f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Event generator's main task or workflow run was cancelled (asyncio.CancelledError)."
             )
-        except Exception as e:
-            # Corrected: removed exc_info=True from print(), which is for logging module
-            print(
-                f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Error in event_generator: {type(e).__name__} - {e}"
-            )
-            # For more detailed trace, consider using actual logging:
-            # import logging; logging.exception(f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Error in event_generator")
+            # Send an error message to the client
             error_payload_model = WorkflowErrorEvent(
-                step_name="event_generator_error", error_message=str(e)
+                step_name="workflow_execution_cancelled",
+                error_message="The workflow execution was cancelled, possibly due to timeout or client disconnect during curation.",
+                workflow_run_id=workflow_run_id,
             )
             error_data = {"type": "workflow_error", **error_payload_model.model_dump()}
-            yield f"1:{json.dumps(error_data)}\n"
+            yield f"1:{json.dumps(error_data)}\\n"
+        except Exception as e:
+            console.print(
+                f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Error in event_generator: {type(e).__name__} - {e}",
+                style="bold red",
+                exc_info=True,
+            )
+            error_payload_model = WorkflowErrorEvent(
+                step_name="event_generator_error",
+                error_message=str(e),
+                workflow_run_id=workflow_run_id,
+            )
+            error_data = {"type": "workflow_error", **error_payload_model.model_dump()}
+            yield f"1:{json.dumps(error_data)}\\n"
         finally:
             print(
                 f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Event generator finishing."
             )
+            # Ensure the future is removed if it's still there and the workflow was handling it
+            # (e.g. if an error occurred before curation_manager's finally block)
+            if workflow_run_id in workflow.active_futures:
+                lingering_future = workflow.active_futures.pop(workflow_run_id, None)
+                if lingering_future and not lingering_future.done():
+                    try:
+                        loop = lingering_future.get_loop()
+                        loop.call_soon_threadsafe(lingering_future.cancel)
+                        print(
+                            f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Lingering curation future cancelled in event_generator finally block."
+                        )
+                    except Exception as e_cancel_linger:
+                        console.print(
+                            f"[SSE WORKFLOW_RUN_ID: {workflow_run_id}] Error cancelling lingering future in finally: {e_cancel_linger}",
+                            style="yellow",
+                        )
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
+        # Headers for Vercel AI SDK compatibility
         headers={"X-Vercel-AI-Data-Stream": "v1"},
     )
 
@@ -405,67 +540,91 @@ async def chat_stream(
 @app.post("/chat/curate")
 async def chat_curate(curation_request: CuratedResponseRequest):
     """
-    Endpoint for the client to submit the curated response for a specific workflow run.
-    This will resolve the asyncio.Future that the corresponding workflow run is awaiting.
+    Endpoint for submitting a human-curated AI response.
+
+    When the `/chat/stream` endpoint emits a `CurationRequiredEvent`, it includes
+    a `workflow_run_id`. The client should use this ID to call this `/chat/curate`
+    endpoint, providing the selected or edited AI response. This action resolves
+    an `asyncio.Future` that the `curation_manager` step in the `AppWorkFlow`
+    is awaiting, allowing the workflow to proceed.
+
+    Args:
+        curation_request: A `CuratedResponseRequest` Pydantic model containing
+                          the `workflow_run_id` and the `curated_response` string.
+
+    Returns:
+        A JSON object confirming success or an error.
+
+    Raises:
+        HTTPException:
+            - 404 if the `workflow_run_id` is not found or already processed.
+            - 409 if curation for the `workflow_run_id` has already been submitted or cancelled.
+            - 500 if there's an internal error processing the curation.
     """
     run_id = curation_request.workflow_run_id
     curated_text = curation_request.curated_response
 
     console.print(
-        f'[API /chat/curate] Received curation for run_id: {run_id}, response: "{curated_text[:50]}..."'
+        f'[API /chat/curate] Received curation for run_id: {run_id}, response: "{curated_text[:70]}..."'
     )
 
     future = workflow.active_futures.get(run_id)
 
     if not future:
         console.print(
-            f"[API /chat/curate] Error: No active future found for run_id: {run_id}"
+            f"[API /chat/curate] Error: No active future found for run_id: {run_id}",
+            style="yellow",
         )
         raise HTTPException(
             status_code=404,
-            detail=f"Workflow run ID {run_id} not found or already processed.",
+            detail=f"Workflow run ID {run_id} not found, already processed, or timed out.",
         )
 
     if future.done():
         console.print(
-            f"[API /chat/curate] Error: Future for run_id: {run_id} is already done."
+            f"[API /chat/curate] Warning: Future for run_id: {run_id} is already done.",
+            style="yellow",
         )
-        # Future is already resolved or cancelled, perhaps client sent twice or too late.
-        # We might still want to remove it if it wasn't removed by the workflow's finally block for some reason (unlikely)
+        # Attempt to remove it if it wasn't by the workflow's finally block (e.g. client sent twice)
         workflow.active_futures.pop(run_id, None)
         raise HTTPException(
-            status_code=409,
-            detail=f"Curation for workflow run ID {run_id} has already been submitted or the run was cancelled.",
+            status_code=409,  # Conflict
+            detail=f"Curation for workflow run ID {run_id} has already been submitted or the run was cancelled/timed out.",
         )
 
     try:
-        # Get the loop associated with the future (which should be the one the workflow task is running on)
         loop = future.get_loop()
-        # Safely set the result of the future from this (FastAPI worker) thread/context
         loop.call_soon_threadsafe(future.set_result, curated_text)
         console.print(
             f"[API /chat/curate] Successfully set future result for run_id: {run_id}"
         )
-        # The future should ideally be removed by the workflow step itself in its finally block once it awakens.
-        # However, to be absolutely sure it doesn't linger if the workflow step somehow fails *after* awakening but *before* its finally:
-        # workflow.active_futures.pop(run_id, None) # Reconsidering this: let workflow manage its own future removal on completion.
+        # The future is removed by the curation_manager step's finally block upon successful completion.
+        # No need to pop it here if future.set_result() is successful.
         return {
             "status": "success",
             "message": f"Curation received for workflow run {run_id}.",
         }
     except Exception as e:
         console.print(
-            f"[API /chat/curate] Error setting future result for run_id {run_id}: {e}"
+            f"[API /chat/curate] Error setting future result for run_id {run_id}: {e}",
+            style="bold red",
+            exc_info=True,
         )
-        # If setting result fails, try to set an exception on the future so the workflow doesn't hang forever.
+        # If setting result fails, try to set an exception on the future so the workflow doesn't hang.
         if not future.done():
             try:
-                loop = future.get_loop()
-                loop.call_soon_threadsafe(future.set_exception, e)
+                loop = future.get_loop()  # Should be the same loop
+                loop.call_soon_threadsafe(
+                    future.set_exception,
+                    RuntimeError(f"Failed to process curation via API: {e}"),
+                )
             except Exception as fut_e:
                 console.print(
-                    f"[API /chat/curate] Further error trying to set exception on future for {run_id}: {fut_e}"
+                    f"[API /chat/curate] Further error trying to set exception on future for {run_id}: {fut_e}",
+                    style="bold red",
                 )
+        # Even if setting exception fails, remove from active_futures to prevent leaks if possible.
+        workflow.active_futures.pop(run_id, None)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to process curation for workflow run {run_id}: {str(e)}",
@@ -474,7 +633,7 @@ async def chat_curate(curation_request: CuratedResponseRequest):
 
 @app.get("/")
 async def read_root():
-    """Simple root endpoint to confirm the API is running."""
+    """Simple root endpoint to confirm the API is running and accessible."""
     return {
         "message": "Welcome to the Elyse AI Workflow API! Visit /docs for API documentation."
     }

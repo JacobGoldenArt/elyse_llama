@@ -1,4 +1,4 @@
-from typing import List
+from typing import Any, Dict, List
 
 from llama_index.core.llms import ChatMessage
 from llama_index.core.workflow import Context
@@ -9,14 +9,20 @@ from backend.app_models import (
     LLMCandidateReadyEvent,
     LLMTokenStreamEvent,
     ModelSettings,
+    WorkflowErrorEvent,
 )
 
 """
-This module provides a service class for handling interactions with Language Models (LLMs)
-using LiteLLM within the Elyse AI workflow.
+Provides `WorkflowLlmService` for handling interactions with Language Models (LLMs)
+using LiteLLM within the Elyse AI application workflow.
 
-It encapsulates the logic for making concurrent calls to multiple LLMs, 
-handling their responses, and managing errors during the API calls.
+This service encapsulates:
+-   Concurrent invocation of multiple LLMs specified in `models_to_use`.
+-   Streaming of LLM response tokens via `LLMTokenStreamEvent`.
+-   Signaling of complete LLM responses (candidates) via `LLMCandidateReadyEvent`.
+-   Error handling for individual LLM API calls, reporting errors as part of the
+    response candidates and optionally via `WorkflowErrorEvent`.
+-   Construction of `LiteLLM` instances with appropriate model settings.
 """
 
 console = Console()
@@ -24,10 +30,20 @@ console = Console()
 
 class WorkflowLlmService:
     """
-    A service dedicated to managing LLM API calls for the application's workflow.
+    Manages LLM API calls for the application's workflow using LiteLLM.
 
-    This service uses LlamaIndex's LiteLLM integration to interact with various
-    LLM providers. It supports calling multiple models and collecting their responses.
+    This service is responsible for:
+    - Iterating through a list of specified models (`models_to_use`).
+    - For each model:
+        - Instantiating `LiteLLM` with parameters from `global_model_settings`.
+        - Invoking the LLM with the provided system prompt and chat history.
+        - Streaming token deltas back to the workflow context via `LLMTokenStreamEvent`.
+        - Emitting an `LLMCandidateReadyEvent` when a full response from a model is received
+          or if an error occurs for that model.
+    - Collecting all responses (successful or error messages) into a list.
+
+    It uses the `Context` object passed from the workflow to stream events directly,
+    allowing real-time updates for connected clients.
     """
 
     async def get_responses_for_workflow(
@@ -37,129 +53,168 @@ class WorkflowLlmService:
         chat_history: List[ChatMessage],
         models_to_use: List[str],
         global_model_settings: ModelSettings,
-    ) -> List[str]:
+    ) -> List[Dict[str, str]]:
         """
-        Calls multiple specified LLMs concurrently with a given system prompt and chat history,
-        streaming tokens and signalling when full candidates are ready.
+        Calls multiple LLMs concurrently, streams tokens, and signals candidate readiness.
 
-        For each model in `models_to_use`, this method constructs a LiteLLM client,
-        sends the conversation history (prepended with the system prompt), and collects
-        the textual response. It streams tokens using `LLMTokenStreamEvent` and signals
-        a complete response using `LLMCandidateReadyEvent`. It handles potential errors
-        during API calls for each model individually, returning either the successful
-        response or an error message string.
+        For each model in `models_to_use`:
+        1.  Prepares messages by prepending the system prompt to the chat history.
+        2.  Initializes a `LiteLLM` client with the specified model and settings.
+        3.  Uses `llm_instance.astream_chat()` to get an asynchronous stream of response chunks.
+        4.  For each chunk (token delta):
+            -   Emits an `LLMTokenStreamEvent` via `ctx.write_event_to_stream()`.
+            -   Appends the token to `full_response_for_model`.
+        5.  Once the stream for a model is complete:
+            -   If a response was received, an `LLMTokenStreamEvent` with `is_final_chunk=True`
+                is emitted, followed by an `LLMCandidateReadyEvent` containing the full response.
+            -   The full response is added to `collected_responses` with its model name.
+        6.  If an error occurs during a model call:
+            -   An error message is logged and captured.
+            -   An `LLMCandidateReadyEvent` is emitted with the error message as the response.
+            -   A `WorkflowErrorEvent` detailing the LLM call failure is streamed.
+            -   The error message is added to `collected_responses` with its model name.
 
         Args:
-            ctx: The workflow context, used for streaming events.
-            system_prompt: The system prompt string to guide the LLMs' behavior.
-            chat_history: A list of ChatMessage objects representing the conversation so far.
-                          This should include the latest user message for the current turn.
-            models_to_use: A list of model identifier strings (e.g., "openai/gpt-4o-mini")
-                           that LiteLLM will use.
-            global_model_settings: A ModelSettings object containing parameters like
-                                   temperature and max_tokens to be applied to each LLM call.
+            ctx: The workflow context, used for streaming events like `LLMTokenStreamEvent`,
+                 `LLMCandidateReadyEvent`, and `WorkflowErrorEvent`.
+            system_prompt: The system prompt string.
+            chat_history: The conversation history (including the latest user message).
+            models_to_use: List of model identifiers for LiteLLM (e.g., "gpt-4o-mini").
+            global_model_settings: `ModelSettings` for temperature, max_tokens, etc.
 
         Returns:
-            A list of strings, where each string is either a successful LLM response
-            or a formatted error message if the call to that specific model failed.
+            A list of dictionaries, where each dictionary contains:
+            {'model_name': str, 'response': str}. The 'response' can be the LLM's
+            generated text or an error message if the call to that model failed.
         """
         messages_for_llm = [
             ChatMessage(role="system", content=system_prompt)
         ] + chat_history
 
+        workflow_run_id = await ctx.get("workflow_run_id", "N/A")
+
         if not models_to_use:
             console.print(
-                "[dim]LLM Service: No models specified. Skipping LLM calls.[/dim]"
+                f"[LLM Service] ({workflow_run_id}) No models specified. Skipping LLM calls.",
+                style="dim",
             )
             return []
 
-        collected_responses_content: List[str] = []
+        collected_responses: List[Dict[str, str]] = []
 
         for model_name in models_to_use:
             full_response_for_model = ""
             try:
                 console.print(
-                    f"[dim]LLM Service: Attempting model [bold]{model_name}[/bold] with system prompt: '{system_prompt[:35]}...' (streaming)[/dim]"
+                    f"[LLM Service] ({workflow_run_id}) Attempting model [bold]{model_name}[/bold] with system prompt: '{system_prompt[:35]}...' (streaming)",
+                    style="dim",
                 )
                 llm_instance = LiteLLM(
                     model=model_name,
                     temperature=global_model_settings.temperature,
                     max_tokens=global_model_settings.max_tokens,
-                    # Add other relevant settings from global_model_settings if needed
+                    # TODO: Add other relevant settings from global_model_settings if supported by LiteLLM wrapper
                     # e.g., top_p=global_model_settings.top_p,
                     # frequency_penalty=global_model_settings.frequency_penalty,
                     # presence_penalty=global_model_settings.presence_penalty
                 )
 
-                # Use astream_chat for streaming responses
                 stream = await llm_instance.astream_chat(messages=messages_for_llm)
-
+                token_received = False
                 async for chunk in stream:
                     token = chunk.delta
-                    full_response_for_model += token
-                    ctx.write_event_to_stream(
-                        LLMTokenStreamEvent(
-                            model_name=model_name,
-                            token=token,
-                            is_final_chunk=False,  # This will be true for the last empty chunk from some providers
+                    if token:
+                        token_received = True
+                        full_response_for_model += token
+                        ctx.write_event_to_stream(
+                            LLMTokenStreamEvent(
+                                model_name=model_name,
+                                token=token,
+                                is_final_chunk=False,
+                                workflow_run_id=workflow_run_id,
+                            )
                         )
-                    )
 
-                # After the loop, the full response is assembled.
-                # Some streaming providers send a final empty chunk or have a specific way to signal end.
-                # We'll assume the loop finishes when the stream ends.
-                # Emit final token event to signal completion if necessary, or just rely on LLMCandidateReadyEvent
-                # For simplicity, we'll emit one last LLMTokenStreamEvent with is_final_chunk=True if the last token was not empty
-                # However, a better approach might be to check a specific attribute on the last chunk if available.
-                # For now, we consider the stream finished and proceed to LLMCandidateReadyEvent.
-                # If full_response_for_model is not empty, it means we received content.
-
-                if full_response_for_model:  # Check if any token was received.
+                if token_received:
                     ctx.write_event_to_stream(
                         LLMTokenStreamEvent(
                             model_name=model_name,
-                            token="",  # No specific final token, just signaling end
+                            token="",
                             is_final_chunk=True,
+                            workflow_run_id=workflow_run_id,
                         )
                     )
                     ctx.write_event_to_stream(
                         LLMCandidateReadyEvent(
                             model_name=model_name,
                             candidate_response=full_response_for_model,
+                            workflow_run_id=workflow_run_id,
                         )
                     )
-                    collected_responses_content.append(full_response_for_model)
+                    collected_responses.append(
+                        {"model_name": model_name, "response": full_response_for_model}
+                    )
+                    console.print(
+                        f"[LLM Service] ({workflow_run_id}) Successfully received response from {model_name}. Length: {len(full_response_for_model)}",
+                        style="green",
+                    )
                 else:
-                    # This case handles if the stream completed but produced no tokens (e.g. model error not caught by exception)
-                    error_msg = f"LLM Service Error: No content streamed from {model_name}. The stream completed without errors but was empty."
-                    console.print(f"[yellow]{error_msg}[/yellow]")
-                    collected_responses_content.append(error_msg)
-                    # Emit a candidate ready event with the error if that's desired for UI consistency
+                    error_msg = f"LLM Service Info: No content streamed from {model_name}. The stream completed without errors but was empty."
+                    console.print(
+                        f"[LLM Service] ({workflow_run_id}) {error_msg}", style="yellow"
+                    )
+                    collected_responses.append(
+                        {"model_name": model_name, "response": error_msg}
+                    )
                     ctx.write_event_to_stream(
                         LLMCandidateReadyEvent(
                             model_name=model_name,
-                            candidate_response=error_msg,  # Send error as candidate
+                            candidate_response=error_msg,
+                            workflow_run_id=workflow_run_id,
+                        )
+                    )
+                    ctx.write_event_to_stream(
+                        WorkflowErrorEvent(
+                            step_name="llm_service",
+                            error_message=error_msg,
+                            model_name=model_name,
+                            workflow_run_id=workflow_run_id,
                         )
                     )
 
             except Exception as e:
-                error_msg = f"LLM Service Error calling {model_name} (streaming): {type(e).__name__} - {e}"
-                console.print(f"[red]{error_msg}[/red]")
-                collected_responses_content.append(error_msg)
-                # Emit an event indicating this candidate failed
+                error_msg = f"LLM Service Error calling {model_name} (streaming): {type(e).__name__} - {str(e)}"
+                console.print(
+                    f"[LLM Service] ({workflow_run_id}) {error_msg}",
+                    style="bold red",
+                    exc_info=False,
+                )
+                collected_responses.append(
+                    {"model_name": model_name, "response": error_msg}
+                )
+
                 ctx.write_event_to_stream(
                     LLMCandidateReadyEvent(
                         model_name=model_name,
-                        candidate_response=error_msg,  # Send error as candidate
+                        candidate_response=error_msg,
+                        workflow_run_id=workflow_run_id,
                     )
                 )
-                # Also emit a final "empty" token stream event for this failed model if strict clients expect it
+                ctx.write_event_to_stream(
+                    WorkflowErrorEvent(
+                        step_name="llm_service_call",
+                        error_message=error_msg,
+                        model_name=model_name,
+                        workflow_run_id=workflow_run_id,
+                    )
+                )
                 ctx.write_event_to_stream(
                     LLMTokenStreamEvent(
                         model_name=model_name,
-                        token="",  # Error occurred
+                        token="",
                         is_final_chunk=True,
+                        workflow_run_id=workflow_run_id,
                     )
                 )
 
-        return collected_responses_content
+        return collected_responses
